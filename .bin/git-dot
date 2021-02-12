@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+function _git_dot {
+	git --git-dir="$HOME/.dotfiles.git" --work-tree="$HOME" "${@}"
+}
+
+_git_dot config --local status.showUntrackedFiles no
+_git_dot "$@"
