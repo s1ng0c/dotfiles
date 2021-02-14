@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+
+# for debugging purpose
+# set -x
+
+# > parse argument list
+_tb_name=""
+_tb_command=""
+_tb_baseline="$(grep ^VERSION_CODENAME /etc/os-release | tail -n 1 | awk -F= '{print $2}')"
+_tb_instance=""
+
+while getopts ":h" opt; do
+	case ${opt} in
+		h ) # help
+			echo "Usage: toolbox <create | run | enter | list | rm | rmi> [-b] [-n] [-h]"
+			exit 1
+			;;
+	esac
+done
+shift $((OPTIND -1))
+
+_tb_command=$1; shift
+while getopts "b:n:f" opt; do
+	case ${opt} in 
+	b ) # baseline
+		_tb_baseline=$OPTARG
+		;;
+	n ) # container name
+		_tb_name=$OPTARG
+		;;
+	f ) # force to remove image
+		_tb_command_forced=$OPTARG
+		;;
+	\? )
+		echo "Invalid Option: -$OPTARG" 1>&2
+		exit 1
+		;;
+	esac
+done
+shift $((OPTIND -1))
+
+_tb_instance=$1
+# < end of argument list parsing
+
+# > parse the baseline to version and release name
+_release=""
+_version=""
+case ${_tb_baseline} in
+	"xenial")
+		_release="xenial"
+		_version="16.04"
+		;;
+	"bionic")
+		_release="bionic"
+		_version="18.04"
+		;;
+	"focal")
+		_release="focal"
+		_version="20.04"
+		;;
+	"16.04")
+		_release="xenial"
+		_version="16.04"
+		;;
+	"18.04")
+		_release="bionic"
+		_version="18.04"
+		;;
+	"20.04")
+		_release="focal"
+		_version="20.04"
+		;;
+esac
+
+# < end of version & release name parsing
+
+# > build toolbox
+if [ ${_tb_command} == "create" ]; then
+	# > download base rootfs
+	_filename="ubuntu-${_version}-minimal-cloudimg-amd64-root.tar.xz"
+	_download_url="http://cloud-images.ubuntu.com/minimal/releases"
+	_download_uri="${_release}/release/${_filename}"
+	_download_cache="/var/tmp/docker"
+
+	# just in case it not yet presented
+	mkdir -p ${_download_cache}
+
+	# do we really need to download then?
+	if [ ! -f "${_download_cache}/${_filename}" ]; then
+		wget "${_download_url}/${_download_uri}" -O ${_download_cache}/${_filename} > /dev/null
+	fi
+
+	# < end of base rootfs downloading
+
+	# > build docker image
+	_mirror="archive.ubuntu.com"
+	_hostname="toolbox-${_version}"
+
+	cat <<-EOF | tee ${_download_cache}/sources.list > /dev/null
+		deb http://${_mirror}/ubuntu ${_release} main
+		deb http://${_mirror}/ubuntu ${_release}-updates main
+		
+		deb http://${_mirror}/ubuntu ${_release} universe
+		deb http://${_mirror}/ubuntu ${_release}-updates universe
+		
+		deb http://${_mirror}/ubuntu ${_release}-security main
+		deb http://${_mirror}/ubuntu ${_release}-security universe
+	EOF
+
+	cat <<-EOF | tee ${_download_cache}/99-aptproxy > /dev/null
+		Acquire::http::Proxy	"${http_proxy}";
+		Acquire::https::Proxy	"${https_proxy}";
+	EOF
+
+	cat <<-EOF | tee ${_download_cache}/Dockerfile > /dev/null
+		FROM scratch
+
+		ADD ${_filename} /
+		ADD sources.list /etc/apt/sources.list
+		ADD 99-aptproxy /etc/apt/apt.conf.d/99-aptproxy
+
+		RUN apt-get update
+		RUN apt-get install -y --no-install-recommends sudo ccrypt git-crypt git htop vim screen
+		RUN useradd -m -l -u $(id -u) -g $(id -g) ${USER} && echo "${USER}     ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+		RUN apt-get autoremove -y
+
+		USER ${USER}
+		
+		CMD ["/usr/bin/screen"]
+	EOF
+
+	pushd ${_download_cache} > /dev/null
+	docker build --network host -t ubuntu/toolbox:${_version} --progress tty --force-rm .
+	popd
+	# > end of docker image building
+fi
+# < end of toolbox building
+
+# > start toolbox
+if [ "${_tb_command}" == "run" ]; then
+	docker container ls --all | grep "${_tb_name}" > /dev/null
+	if [ $? -eq 0 ]; then
+		docker start ${_tb_name} > /dev/null
+	else
+		_tb_home_volume="${HOME}/.docker-home/${_tb_name}"
+		if [ ! -d "${_tb_home_volume}" ]; then
+			mkdir -p "${_tb_home_volume}"
+		fi
+
+		docker run -d -it --privileged --net host --add-host ${_tb_name}:127.0.0.1 --hostname ${_tb_name} --name ${_tb_name} \
+			-v "${HOME}/.docker-home/shared":/work \
+			-v "${_tb_home_volume}/.vcache":/var/cache \
+			-v "${_tb_home_volume}/.vtmp":/var/tmp \
+			-v "${_tb_home_volume}":/home/${USER} \
+			-v "${_tb_home_volume}/.opt":/opt \
+			ubuntu/toolbox:${_version} > /dev/null
+	fi
+
+	docker attach ${_tb_name}
+fi
+
+if [ "${_tb_command}" == "enter" ]; then
+	docker container ls --all | grep "${_tb_instance}" > /dev/null
+	if [ $? -eq 0 ]; then
+		docker start ${_tb_instance} > /dev/null
+		docker attach ${_tb_instance}
+	fi
+	exit 0
+fi
+# < end of toolbox starting
+
+if [ "${_tb_command}" == "list" ]; then
+	echo "+ Baselines:"
+	docker image list --all --format "\t- {{.Repository}}:{{.Tag}}" | grep "ubuntu/toolbox"
+
+	echo "+ Instances:"
+	docker container list --all --format "\t- {{.Image}} / {{.Names}} - {{.Status}}" | grep "ubuntu/toolbox"
+	exit 0
+fi
+
+if [ "${_tb_command}" == "rm" ]; then
+	docker container ls --all | grep "${_tb_instance}" > /dev/null
+	if [ $? -ne 0 ]; then exit 0; fi
+
+	if [ -z "${_tb_command_forced}" ]; then
+		docker container rm "${_tb_instance}" > /dev/null
+	else
+		docker container rm -f "${_tb_instance}" > /dev/null
+	fi
+	exit 0
+fi
+
+if [ "${_tb_command}" == "rmi" ]; then
+	docker image ls --all | grep "${_tb_instance}" > /dev/null
+	if [ $? -ne 0 ]; then exit 0; fi
+
+	if [ -z "${_tb_command_forced}" ]; then
+		docker rmi "ubuntu/toolbox:${_tb_instance}" > /dev/null
+	else
+		docker rmi -f "ubuntu/toolbox:${_tb_instance}" > /dev/null
+	fi
+	exit 0
+fi
+
